@@ -442,19 +442,22 @@ def agent_search_node(state: AgentSubgraphState) -> dict:
     print(f"\n  [{agent_name}] Searching with {len(queries)} queries...")
     results = []
     def fetch_query(q):
-        try:
-            search_result = app.search(query=q)
-            data = getattr(search_result, 'web', [])
-            extracted = []
-            for item in data:
-                url = getattr(item, 'url', 'Unknown URL')
-                content = getattr(item, 'description', '') or getattr(item, 'title', 'No content')
-                if content and len(content.strip()) > 20:
-                    extracted.append({"query": q, "url": url, "content": content, "agent": agent_id})
-            return extracted
-        except Exception as e:
-            print(f"    Error searching '{q}': {e}")
-            return []
+        for attempt in range(3):
+            try:
+                search_result = app.search(query=q)
+                data = getattr(search_result, 'web', [])
+                extracted = []
+                for item in data:
+                    url = getattr(item, 'url', 'Unknown URL')
+                    content = getattr(item, 'description', '') or getattr(item, 'title', 'No content')
+                    if content and len(content.strip()) > 20:
+                        extracted.append({"query": q, "url": url, "content": content, "agent": agent_id})
+                return extracted
+            except Exception as e:
+                print(f"    Error searching '{q}' (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+        return []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(fetch_query, q): q for q in queries[:3]}
