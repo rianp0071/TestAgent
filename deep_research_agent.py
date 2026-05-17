@@ -32,6 +32,7 @@ import concurrent.futures
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Annotated, Literal
 from typing_extensions import TypedDict
+from langsmith import traceable
 from openai import OpenAI
 import openai
 
@@ -177,6 +178,7 @@ def safe_parse_json(text) -> Optional[dict]:
     return None
 
 
+@traceable(name="call_llm", run_type="llm")
 def call_llm(prompt: str, is_json: bool = False, retries: int = 3) -> Optional[any]:
     """
     Central LLM caller with:
@@ -348,6 +350,7 @@ AGENT_CONFIGS = {
 }
 
 
+@traceable(name="planner_node")
 def planner_node(state: ResearchState) -> dict:
     """Phase 1: Generate per-agent subtasks from topic."""
     topic = state["topic"]
@@ -421,19 +424,22 @@ Return ONLY a JSON object:
 # Shared Research Agent Logic (used by all 4 specialized agents)
 # =============================================================
 
-def _run_researcher(agent_id: str, topic: str, queries: list) -> list:
-    """Core logic shared by all specialized researcher agents.
-    Performs search + extraction in one pass.
-    Returns a list of extracted claims.
-    """
+class AgentSubgraphState(TypedDict):
+    topic: str
+    agent_id: str
+    queries: list
+    unique_results: list
+    claims: list
+
+@traceable(name="agent_search_node")
+def agent_search_node(state: AgentSubgraphState) -> dict:
+    agent_id = state["agent_id"]
+    topic = state["topic"]
+    queries = state["queries"]
     config = AGENT_CONFIGS[agent_id]
     agent_name = config["name"]
-    extraction_hint = config["extraction_prompt"]
-    trust_weight = config["trust_weight"]
 
     print(f"\n  [{agent_name}] Searching with {len(queries)} queries...")
-
-    # --- Search ---
     results = []
     def fetch_query(q):
         try:
@@ -457,7 +463,6 @@ def _run_researcher(agent_id: str, topic: str, queries: list) -> list:
 
     metrics.search_results_returned += len(results)
 
-    # Deduplicate
     seen_urls = set()
     unique = []
     for r in results:
@@ -467,13 +472,22 @@ def _run_researcher(agent_id: str, topic: str, queries: list) -> list:
 
     metrics.search_results_after_dedup += len(unique)
     print(f"    [{agent_name}] {len(unique)} unique results found")
+    return {"unique_results": unique}
 
-    if not unique:
-        return []
+@traceable(name="agent_extract_node")
+def agent_extract_node(state: AgentSubgraphState) -> dict:
+    agent_id = state["agent_id"]
+    topic = state["topic"]
+    unique_results = state.get("unique_results", [])
+    if not unique_results:
+        return {"claims": []}
 
-    # --- Extract ---
+    config = AGENT_CONFIGS[agent_id]
+    agent_name = config["name"]
+    extraction_hint = config["extraction_prompt"]
+
     new_claims = []
-    top_results = unique[:10]
+    top_results = unique_results[:10]
     batches = [top_results[i:i + 5] for i in range(0, len(top_results), 5)]
 
     for batch_idx, batch in enumerate(batches):
@@ -506,7 +520,6 @@ Return ONLY a JSON object:
         }}
     ]
 }}"""
-
         try:
             extracted = call_llm(prompt, is_json=True)
             if not extracted or "claims" not in extracted:
@@ -528,7 +541,6 @@ Return ONLY a JSON object:
                 c["verified"] = False
                 c["gate_passed"] = False
                 c["agent"] = agent_id
-                c.pop("source_id", None)
                 new_claims.append(c)
 
         except Exception as e:
@@ -537,35 +549,54 @@ Return ONLY a JSON object:
 
     metrics.claims_extracted += len(new_claims)
     print(f"    [{agent_name}] Extracted {len(new_claims)} claims")
-    return new_claims
+    return {"claims": new_claims}
 
+def build_agent_subgraph() -> StateGraph:
+    builder = StateGraph(AgentSubgraphState)
+    builder.add_node("agent_search", agent_search_node)
+    builder.add_node("agent_extract", agent_extract_node)
+    builder.add_edge(START, "agent_search")
+    builder.add_edge("agent_search", "agent_extract")
+    builder.add_edge("agent_extract", END)
+    return builder.compile()
 
 # =============================================================
-# Parallel Research Dispatcher + Per-Agent Nodes
+# Parallel Research Dispatcher
 # =============================================================
 
+@traceable(name="research_dispatcher")
 def research_dispatcher(state: ResearchState) -> dict:
-    """Fan-out: run all specialized agents in parallel."""
+    """Fan-out: run all specialized agent subgraphs in parallel."""
     topic = state["topic"]
     subtasks = state.get("subtasks", [])
 
-    print("\n--- PHASE 2+3: PARALLEL SPECIALIZED RESEARCH ---")
-    print(f"  Dispatching {len(subtasks)} research agents in parallel...")
+    print("\n--- PHASE 2+3: PARALLEL AGENT SUBGRAPHS ---")
+    print(f"  Dispatching {len(subtasks)} agent subgraphs in parallel...")
 
     all_new_claims = []
     agent_stats = {}
+    
+    agent_app = build_agent_subgraph()
 
-    # Run all agents in parallel using ThreadPoolExecutor
-    def run_agent(subtask):
+    def run_agent_subgraph(subtask):
         agent_id = subtask.get("agent", "gov_researcher")
         queries = subtask.get("queries", [])
         if not queries:
             return agent_id, []
-        claims = _run_researcher(agent_id, topic, queries)
-        return agent_id, claims
+        
+        initial_sub_state = {
+            "topic": topic,
+            "agent_id": agent_id,
+            "queries": queries,
+            "unique_results": [],
+            "claims": []
+        }
+        # Invoke the LangGraph subgraph
+        final_sub_state = agent_app.invoke(initial_sub_state)
+        return agent_id, final_sub_state.get("claims", [])
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(run_agent, st) for st in subtasks]
+        futures = [executor.submit(run_agent_subgraph, st) for st in subtasks]
         for future in concurrent.futures.as_completed(futures):
             agent_id, claims = future.result()
             all_new_claims.extend(claims)
@@ -586,6 +617,7 @@ def research_dispatcher(state: ResearchState) -> dict:
     return {"all_claims": all_new_claims, "agent_stats": agent_stats}
 
 
+@traceable(name="verify_node")
 def verify_node(state: ResearchState) -> dict:
     """Phase 4: Verify claims against their supporting quotes."""
     topic = state["topic"]
@@ -659,6 +691,7 @@ Return ONLY a JSON object:
     return {}
 
 
+@traceable(name="citation_gate_node")
 def citation_gate_node(state: ResearchState) -> dict:
     """Phase 5: Filter to only well-sourced, verified claims."""
     all_claims = state.get("all_claims", [])
@@ -686,6 +719,7 @@ def citation_gate_node(state: ResearchState) -> dict:
     return {"gated_claims": gated}
 
 
+@traceable(name="reflection_node")
 def reflection_node(state: ResearchState) -> dict:
     """Phase 6: Adaptive reflection with targeted agent re-routing.
     
@@ -831,6 +865,7 @@ Return ONLY a JSON object:
     return {"should_stop": False, "subtasks": valid_subtasks}
 
 
+@traceable(name="synthesis_node")
 def synthesis_node(state: ResearchState) -> dict:
     """Phase 7: Generate final report from gated claims + memory."""
     topic = state["topic"]
@@ -919,6 +954,7 @@ Format:
 # Pinecone Memory Nodes
 # =============================================================
 
+@traceable(name="memory_recall_node")
 def memory_recall_node(state: ResearchState) -> dict:
     """Query Pinecone for prior claims relevant to this topic.
     Runs once at the start, before research begins.
@@ -974,6 +1010,7 @@ def memory_recall_node(state: ResearchState) -> dict:
         return {"memory_recalled_claims": []}
 
 
+@traceable(name="memory_store_node")
 def memory_store_node(state: ResearchState) -> dict:
     """Store verified, gated claims in Pinecone for future recall.
     Runs after citation gate — only stores high-quality claims.
