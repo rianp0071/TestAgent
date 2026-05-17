@@ -1,1 +1,6 @@
 .env
+__pycache__/
+*.pyc
+.pytest_cache/
+sandbox_project/__pycache__/
+sandbox_project/.pytest_cache/
