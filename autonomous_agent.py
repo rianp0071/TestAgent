@@ -4,6 +4,8 @@ import subprocess
 import ast
 import threading
 import requests
+import json
+import logging
 from typing import Literal, List, Tuple, Annotated
 from typing_extensions import TypedDict
 
@@ -18,10 +20,31 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 
+# Import modular tools
+from tools.models import ShellResult, DelegationResult, VerificationResult, GitDiffResult
+from tools.verification import run_tests, run_linter, run_typecheck, get_git_diff
+from tools.delegation import antigravity_agent, claude_code_agent, codex_agent
+
 load_dotenv()
 
 # ==========================================
-# Level 3: Memory Initialization
+# Logging Setup
+# ==========================================
+logging.basicConfig(
+    filename='execution.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("AutonomousAgent")
+
+# Also log to console for real-time visibility
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+logger.addHandler(console_handler)
+
+# ==========================================
+# Memory Initialization
 # ==========================================
 print("Initializing Pinecone Vector DB for Memory...")
 pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
@@ -38,7 +61,7 @@ embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 vectorstore = PineconeVectorStore(index_name=index_name, embedding=embeddings)
 
 # ==========================================
-# 1. Define Tools
+# Core Tools
 # ==========================================
 
 hitl_lock = threading.Lock()
@@ -55,6 +78,7 @@ class SaveMemoryInput(BaseModel):
 def save_memory(information: str) -> str:
     """Save an important learning or fact to long-term memory."""
     print(f"\n[Action] Saving to Memory: {information}")
+    logger.info(f"Saving to memory: {information}")
     vectorstore.add_texts([information])
     return "Successfully saved to memory."
 
@@ -98,27 +122,31 @@ class ShellCommandInput(BaseModel):
 
 @tool("shell_command", args_schema=ShellCommandInput)
 def shell_command(command: str, purpose: str) -> str:
-    """Execute a shell command and return its stdout, stderr, and exit code."""
+    """Execute a shell command and return structured JSON with success, exit_code, stdout, stderr."""
+    logger.info(f"Running shell command: {command} | Purpose: {purpose}")
     print(f"\n[Action] Running shell command: `{command}`")
     print(f"[Purpose] {purpose}")
+    
+    ALLOWED_PREFIXES = ("python", "pytest", "ls", "dir", "echo", "pwd", "cat", "grep", "npm", "node", "git", "pip")
+    base_cmd = command.strip().split()[0] if command.strip() else ""
+    is_safe = any(base_cmd == p or base_cmd.endswith("/" + p) or base_cmd.endswith("\\" + p) for p in ALLOWED_PREFIXES)
+    
+    if not is_safe:
+        if not get_hitl_approval(f"\n[HITL] Security Warning: Command '{base_cmd}' not in whitelist. Approve? (y/n) > "):
+            logger.warning(f"Command rejected by user: {command}")
+            return ShellResult(success=False, exit_code=-1, stdout="", stderr="Rejected by sandbox.").model_dump_json()
+
     try:
-        result = subprocess.run(
-            command, 
-            shell=True, 
-            capture_output=True, 
-            text=True, 
-            cwd="sandbox_project",
-            timeout=10
-        )
-        output = (f"Exit code: {result.returncode}\n"
-                  f"Stdout: {result.stdout.strip()}\n"
-                  f"Stderr: {result.stderr.strip()}")
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, cwd="sandbox_project", timeout=30)
+        logger.info(f"Command exit code: {result.returncode}")
         print(f"[Observation] Exit {result.returncode}")
-        return output
+        return ShellResult(
+            success=(result.returncode == 0), exit_code=result.returncode,
+            stdout=result.stdout.strip(), stderr=result.stderr.strip()
+        ).model_dump_json()
     except Exception as e:
-        err = f"Error executing command: {str(e)}"
-        print(f"[Observation] {err}")
-        return err
+        logger.error(f"Shell error: {e}")
+        return ShellResult(success=False, exit_code=-1, stdout="", stderr=str(e)).model_dump_json()
 
 class ReadFileInput(BaseModel):
     filepath: str = Field(description="The path to the file to read, relative to sandbox_project")
@@ -147,25 +175,24 @@ class WriteFileInput(BaseModel):
 def write_file(filepath: str, content: str) -> str:
     """Write new content to a file, completely overwriting it."""
     print(f"\n[Action] Writing file: {filepath}")
-    
-    # LEVEL 6: Human In The Loop
     if not get_hitl_approval(f"\n[HITL] Approve full overwrite of {filepath}? (y/n) > "):
         print("[Observation] Write rejected.")
         return "Write rejected by human user. Please modify your plan."
-        
     try:
         path = os.path.join("sandbox_project", filepath)
+        os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
         with open(path, "w") as f:
             f.write(content)
+        logger.info(f"Wrote file: {filepath}")
         print("[Observation] Write successful.")
         return f"Successfully wrote to {filepath}"
     except Exception as e:
         err = f"Error writing file: {str(e)}"
-        print(f"[Observation] {err}")
+        logger.error(err)
         return err
 
 class ListDirectoryInput(BaseModel):
-    directory: str = Field(description="The directory path to list, relative to sandbox_project. Use '.' for the root of sandbox_project.", default=".")
+    directory: str = Field(description="The directory path to list, relative to sandbox_project. Use '.' for root.", default=".")
 
 @tool("list_directory", args_schema=ListDirectoryInput)
 def list_directory(directory: str = ".") -> str:
@@ -178,9 +205,7 @@ def list_directory(directory: str = ".") -> str:
         items = os.listdir(path)
         return "\n".join(items) if items else "Directory is empty."
     except Exception as e:
-        err = f"Error listing directory: {str(e)}"
-        print(f"[Observation] {err}")
-        return err
+        return f"Error listing directory: {str(e)}"
 
 class SearchCodebaseInput(BaseModel):
     query: str = Field(description="The text to search for")
@@ -208,9 +233,7 @@ def search_codebase(query: str, directory: str = ".") -> str:
                     pass
         return "\n".join(matches) if matches else "No matches found."
     except Exception as e:
-        err = f"Error searching codebase: {str(e)}"
-        print(f"[Observation] {err}")
-        return err
+        return f"Error searching codebase: {str(e)}"
 
 class DeleteFileInput(BaseModel):
     filepath: str = Field(description="The path to the file to delete, relative to sandbox_project")
@@ -219,22 +242,17 @@ class DeleteFileInput(BaseModel):
 def delete_file(filepath: str) -> str:
     """Delete a file completely."""
     print(f"\n[Action] Deleting file: {filepath}")
-    
     if not get_hitl_approval(f"\n[HITL] Approve DELETION of {filepath}? (y/n) > "):
-        print("[Observation] Deletion rejected.")
-        return "Deletion rejected by human user. Find another way."
-        
+        return "Deletion rejected by human user."
     try:
         path = os.path.join("sandbox_project", filepath)
         if not os.path.exists(path):
             return "Error: File does not exist."
         os.remove(path)
-        print("[Observation] Deletion successful.")
+        logger.info(f"Deleted: {filepath}")
         return f"Successfully deleted {filepath}"
     except Exception as e:
-        err = f"Error deleting file: {str(e)}"
-        print(f"[Observation] {err}")
-        return err
+        return f"Error deleting file: {str(e)}"
 
 class ReplaceLinesInput(BaseModel):
     filepath: str = Field(description="The path to the file to edit, relative to sandbox_project")
@@ -244,42 +262,52 @@ class ReplaceLinesInput(BaseModel):
 
 @tool("replace_lines", args_schema=ReplaceLinesInput)
 def replace_lines(filepath: str, start_line: int, end_line: int, replacement: str) -> str:
-    """Safely replace a specific range of lines in a file. This is highly preferred over write_file."""
+    """Safely replace a specific range of lines in a file. Preferred over write_file."""
     print(f"\n[Action] Replacing lines {start_line}-{end_line} in {filepath}")
-    
-    # LEVEL 6: Human In The Loop
     if not get_hitl_approval(f"\n[HITL] Approve replacing lines {start_line}-{end_line} in {filepath}? (y/n) > "):
-        print("[Observation] Patch rejected.")
-        return "Patch rejected by human user. Find another way or ask for clarification."
-        
+        return "Patch rejected by human user."
     try:
         path = os.path.join("sandbox_project", filepath)
         with open(path, "r") as f:
             lines = f.readlines()
-            
         if start_line < 1 or end_line > len(lines) or start_line > end_line:
             return f"Error: Invalid line range {start_line}-{end_line} for file with {len(lines)} lines."
-            
-        # Replace the lines (0-indexed)
         prefix = lines[:start_line - 1]
         suffix = lines[end_line:]
-        
-        # Ensure replacement ends with a newline if the original did
         new_lines = replacement.splitlines(keepends=True)
         if new_lines and not new_lines[-1].endswith('\n'):
             new_lines[-1] += '\n'
-            
-        final_lines = prefix + new_lines + suffix
-        
         with open(path, "w") as f:
-            f.writelines(final_lines)
-            
-        print("[Observation] Line replacement successful.")
+            f.writelines(prefix + new_lines + suffix)
+        logger.info(f"Replaced lines {start_line}-{end_line} in {filepath}")
         return f"Successfully replaced lines {start_line}-{end_line} in {filepath}"
     except Exception as e:
-        err = f"Error editing file: {str(e)}"
-        print(f"[Observation] {err}")
-        return err
+        logger.error(f"Replace error: {e}")
+        return f"Error editing file: {str(e)}"
+
+class ApplyPatchInput(BaseModel):
+    patch_content: str = Field(description="The unified diff patch content to apply")
+
+@tool("apply_patch", args_schema=ApplyPatchInput)
+def apply_patch(patch_content: str) -> str:
+    """Apply a unified diff patch to modify files."""
+    print(f"\n[Action] Applying patch...")
+    logger.info("Applying patch")
+    if not get_hitl_approval(f"\n[HITL] Approve applying patch? (y/n) > "):
+        return "Patch rejected by human user."
+    try:
+        patch_path = os.path.join("sandbox_project", "temp_patch.diff")
+        with open(patch_path, "w") as f:
+            f.write(patch_content)
+        result = subprocess.run(["git", "apply", "temp_patch.diff"], cwd="sandbox_project", capture_output=True, text=True)
+        os.remove(patch_path)
+        if result.returncode == 0:
+            logger.info("Patch applied successfully.")
+            return "Patch applied successfully."
+        else:
+            return f"Failed to apply patch: {result.stderr}"
+    except Exception as e:
+        return f"Error applying patch: {str(e)}"
 
 class CreateDirectoryInput(BaseModel):
     directory: str = Field(description="The directory path to create, relative to sandbox_project")
@@ -289,12 +317,11 @@ def create_directory(directory: str) -> str:
     """Create a new directory or folder structure."""
     print(f"\n[Action] Creating directory: {directory}")
     if not get_hitl_approval(f"\n[HITL] Approve creation of directory {directory}? (y/n) > "):
-        print("[Observation] Directory creation rejected.")
-        return "Directory creation rejected by human user."
+        return "Directory creation rejected."
     try:
         path = os.path.join("sandbox_project", directory)
         os.makedirs(path, exist_ok=True)
-        print("[Observation] Directory created successfully.")
+        logger.info(f"Created directory: {directory}")
         return f"Successfully created directory {directory}"
     except Exception as e:
         return f"Error creating directory: {str(e)}"
@@ -304,38 +331,32 @@ class FirecrawlSearchInput(BaseModel):
 
 @tool("firecrawl_search", args_schema=FirecrawlSearchInput)
 def firecrawl_search(query: str) -> str:
-    """Search the web using Firecrawl for documentation or knowledge. Essential for web app development."""
+    """Search the web using Firecrawl for documentation or knowledge."""
     print(f"\n[Action] Web Search (Firecrawl): {query}")
     if not get_hitl_approval(f"\n[HITL] Approve web search for '{query}'? (y/n) > "):
-        print("[Observation] Web search rejected.")
         return "Search rejected by human user."
     try:
         api_key = os.environ.get("FIRECRAWL_API_KEY")
         if not api_key:
-            return "Error: FIRECRAWL_API_KEY not found in environment."
-            
+            return "Error: FIRECRAWL_API_KEY not found."
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {"query": query, "pageOptions": {"fetchPageContent": False}}
         response = requests.post("https://api.firecrawl.dev/v1/search", json=payload, headers=headers)
-        
         if response.status_code != 200:
             return f"API Error {response.status_code}: {response.text}"
-            
         data = response.json()
         results = data.get("data", [])
         if not results:
             return "No results found."
-            
         formatted = []
         for r in results[:4]:
             formatted.append(f"Title: {r.get('title')}\nURL: {r.get('url')}\nSnippet: {r.get('description')}\n")
-        print("[Observation] Web search successful.")
         return "\n".join(formatted)
     except Exception as e:
         return f"Error executing web search: {str(e)}"
 
 # ==========================================
-# 2. Level 3-6: Multi-Agent Architecture
+# Multi-Agent Architecture (Plan-Execute-Verify)
 # ==========================================
 
 class PlanExecuteState(TypedDict):
@@ -352,16 +373,20 @@ class ReplannerOutput(BaseModel):
     """The output of the replanner."""
     is_complete: bool = Field(description="Whether the entire original task has been successfully completed.")
     final_response: str = Field(description="The final answer or summary to give to the user if complete.", default="")
-    new_plan: List[str] = Field(description="The remaining steps to execute if not complete. Can include new steps.", default_factory=list)
+    new_plan: List[str] = Field(description="The remaining steps to execute if not complete.", default_factory=list)
 
-# Initialize LLM
+# Initialize LLM + tool registry
 tools = [
-    shell_command, read_file, write_file, delete_file, create_directory, 
-    list_directory, search_codebase, replace_lines, save_memory, 
-    search_memory, get_ast_outline, firecrawl_search
+    shell_command, read_file, write_file, delete_file, create_directory,
+    list_directory, search_codebase, replace_lines, apply_patch, save_memory,
+    search_memory, get_ast_outline, firecrawl_search,
+    # Delegation tools
+    antigravity_agent, claude_code_agent, codex_agent,
+    # Verification tools
+    run_tests, run_linter, run_typecheck, get_git_diff,
 ]
 llm = ChatOpenAI(
-    model="openai/gpt-4o-mini", 
+    model="openai/gpt-4o-mini",
     temperature=0,
     api_key=os.environ.get("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1",
@@ -369,62 +394,90 @@ llm = ChatOpenAI(
 
 executor_agent = create_react_agent(llm, tools)
 
-def plan_step(state: PlanExecuteState):
-    print("\n[Planner] Decomposing task into steps...")
-    task = state["task"]
-    prompt = f"""You are the Planner Agent. Decompose this task into a step-by-step plan.
+PLANNER_PROMPT = """You are the Planner Agent for an institutional-grade autonomous coding system.
+Decompose this task into a step-by-step plan.
 Task: {task}
-Remember:
-- Make sure to explore the codebase first and check memory for past learnings using search_memory.
-- For scaffolding large projects or web apps, use create_directory and write_file.
-- For modifying existing files, strictly use replace_lines. Always read_file first to get the exact line numbers.
-- To completely remove a file, strictly use delete_file.
-- To find documentation or solve complex logic, use firecrawl_search.
-- If fixing a bug, explicitly include a step to write tests if none exist, then run tests, then fix the bug, then verify.
-- Use get_ast_outline to understand file structure easily.
-- Before ending, save your learnings to memory using save_memory.
+
+Available capabilities:
+- FILESYSTEM: read_file, write_file, replace_lines, apply_patch, delete_file, create_directory, list_directory, search_codebase
+- MEMORY: save_memory, search_memory
+- ANALYSIS: get_ast_outline, shell_command
+- RESEARCH: firecrawl_search
+- DELEGATION: antigravity_agent (active), claude_code_agent (inactive), codex_agent (inactive)
+- VERIFICATION: run_tests, run_linter, run_typecheck, get_git_diff
+
+Rules:
+- Always explore the codebase first and check memory for past learnings.
+- For complex tasks, DELEGATE to antigravity_agent then VERIFY with run_tests + get_git_diff.
+- After ANY delegation, ALWAYS add verification steps: get_git_diff, run_tests, run_linter.
+- If verification fails, add steps to analyze failures and reprompt the agent.
+- For modifying existing files, use replace_lines. Always read_file first.
+- Before ending, save learnings to memory.
 Return ONLY the plan."""
+
+EXECUTOR_PROMPT = (
+    "You are the Executor Agent (Orchestrator) of an institutional-grade coding system. "
+    "Execute the given step using your tools. You operate inside 'sandbox_project'.\n\n"
+    "DELEGATION PROTOCOL:\n"
+    "1. When delegating to antigravity_agent, provide clear, specific prompts.\n"
+    "2. After delegation, ALWAYS run get_git_diff to inspect what changed.\n"
+    "3. ALWAYS run run_tests to verify correctness.\n"
+    "4. If tests fail, analyze the failure, then either fix manually or reprompt the agent.\n"
+    "5. Log what the external agent changed and why verification passed/failed.\n\n"
+    "EDITING PROTOCOL:\n"
+    "- Prefer replace_lines or apply_patch over write_file for existing code.\n"
+    "- Always read_file first to get exact line numbers.\n\n"
+    "SAFETY:\n"
+    "- If an action is rejected by user, stop and report failure.\n"
+    "- Return a detailed summary including: what changed, verification results, and next steps."
+)
+
+
+def plan_step(state: PlanExecuteState):
+    print("\n" + "="*60)
+    print("[Planner] Decomposing task into steps...")
+    print("="*60)
+    task = state["task"]
+    logger.info(f"PLAN START: {task}")
+    prompt = PLANNER_PROMPT.format(task=task)
     response = llm.with_structured_output(Plan).invoke([HumanMessage(content=prompt)])
     print(f"[Planner] Created Plan:")
     for i, s in enumerate(response.steps):
         print(f"  {i+1}. {s}")
+    logger.info(f"PLAN: {response.steps}")
     return {"plan": response.steps, "past_steps": []}
+
 
 def execute_step(state: PlanExecuteState):
     current_step = state["plan"][0]
     task = state["task"]
-    print(f"\n[Executor] Executing step: {current_step}")
-    
-    sys_prompt = SystemMessage(content=(
-        "You are the Executor Agent. Your job is to execute the given step of a larger plan using your tools. "
-        "You are operating inside the 'sandbox_project' directory.\n"
-        "If asked to write tests and none exist, write them dynamically. "
-        "Strictly prefer replace_lines for editing existing code. "
-        "Strictly use delete_file to remove files. "
-        "Always read_file first to get exact line numbers. "
-        "If an action is rejected by user, stop and report failure to planner. "
-        "When the step is done, return a detailed summary of what you did and the outcomes."
-    ))
-    
-    # Run the executor subgraph
+    print(f"\n{'='*60}")
+    print(f"[Executor] Step: {current_step}")
+    print(f"{'='*60}")
+    logger.info(f"EXECUTE START: {current_step}")
+
+    sys_prompt = SystemMessage(content=EXECUTOR_PROMPT)
     result = executor_agent.invoke(
         {"messages": [sys_prompt, HumanMessage(content=f"Overall task: {task}\n\nCurrent Step to execute: {current_step}")]}
     )
-    
+
     summary = result["messages"][-1].content
+    logger.info(f"EXECUTE DONE: {current_step} | Summary: {summary[:200]}")
     print(f"\n[Executor] Step completed.\nSummary: {summary}\n")
-    
     return {"past_steps": [(current_step, summary)]}
 
+
 def replan_step(state: PlanExecuteState):
-    print("\n[Verifier/Replanner] Verifying outcomes and updating plan...")
+    print(f"\n{'='*60}")
+    print("[Verifier/Replanner] Verifying outcomes...")
+    print(f"{'='*60}")
     task = state["task"]
     plan = state["plan"]
     past_steps = state["past_steps"]
-    
+
     past_steps_str = "\n\n".join([f"Step: {s}\nOutcome: {o}" for s, o in past_steps])
-    
-    prompt = f"""You are the Verifier and Replanner Agent.
+
+    prompt = f"""You are the Verifier and Replanner Agent for an institutional-grade system.
 Original Task: {task}
 
 Past Executed Steps and Outcomes:
@@ -433,21 +486,32 @@ Past Executed Steps and Outcomes:
 Current Remaining Plan (excluding the step just executed):
 {plan[1:] if len(plan) > 0 else []}
 
+Verification Rules:
+1. If ANY delegation was done, check if verification (tests, diff, lint) was also performed.
+2. If verification was NOT performed after delegation, add verification steps.
+3. If tests failed, add debugging/fixing steps BEFORE continuing.
+4. Only mark complete if ALL tests pass and the task is fully solved.
+5. Explain your reasoning for the decision.
+
 Your job:
-1. Verify if the original task is completely solved based on the outcomes. For example, if tests were supposed to run and pass, did they?
-2. If completely solved, set is_complete to true and write a final_response.
-3. If NOT solved, or if the current step failed, update the plan. You can add new steps (like 'debug the failure', 'fix the syntax error') or keep the remaining steps. Return the new list of steps in new_plan.
+1. Verify if the original task is completely solved.
+2. If solved AND verified, set is_complete=true and write final_response.
+3. If NOT solved, return updated new_plan with remaining + new steps.
 """
+    logger.info("REPLAN START")
     response = llm.with_structured_output(ReplannerOutput).invoke([HumanMessage(content=prompt)])
-    
+
     if response.is_complete:
+        logger.info(f"TASK COMPLETE: {response.final_response[:200]}")
         print("[Verifier] Task is complete!")
         return {"response": response.final_response, "plan": []}
     else:
+        logger.info(f"REPLAN: {response.new_plan}")
         print(f"[Verifier] Task not complete. Updated Plan:")
         for i, s in enumerate(response.new_plan):
             print(f"  {i+1}. {s}")
         return {"plan": response.new_plan}
+
 
 def should_end(state: PlanExecuteState):
     if "response" in state and state["response"]:
@@ -468,16 +532,18 @@ workflow.add_conditional_edges("replan", should_end)
 app = workflow.compile()
 
 # ==========================================
-# 3. Execution Entrypoint
+# Execution Entrypoint
 # ==========================================
 
 if __name__ == "__main__":
-    print("==================================================")
-    print("Initializing Level 3-6 Codex-Grade Autonomous Agent")
-    print("(Memory + Safe Editing + HITL + Planner/Executor)")
-    print("==================================================")
+    print("=" * 60)
+    print("  Institutional-Grade Autonomous Coding Agent")
+    print("  (Plan → Execute → Verify → Replan)")
+    print("  Delegation: Antigravity IDE (active)")
+    print("  Verification: pytest + flake8 + mypy + git diff")
+    print("=" * 60)
     print("Type 'exit' or 'quit' to stop.\n")
-    
+
     while True:
         try:
             user_input = input("\nAgent Task > ")
@@ -485,19 +551,21 @@ if __name__ == "__main__":
                 break
             if not user_input.strip():
                 continue
-            
-            # Start the autonomous loop
+
+            logger.info(f"USER TASK: {user_input}")
             final_state = app.invoke(
                 {"task": user_input},
                 config={"configurable": {"thread_id": "sandbox_test_level6"}, "recursion_limit": 50}
             )
-            
-            print("\n==================================================")
+
+            print("\n" + "=" * 60)
             print("Final Agent Response:")
-            print("==================================================")
+            print("=" * 60)
             print(final_state["response"])
+            logger.info(f"FINAL RESPONSE: {final_state['response'][:300]}")
         except KeyboardInterrupt:
             print("\nExiting...")
             break
         except Exception as e:
+            logger.error(f"RUNTIME ERROR: {e}")
             print(f"\nError: {e}")
